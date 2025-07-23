@@ -180,8 +180,6 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Password Storage API"
-    - "Time-based Access Control"
     - "Arabic RTL Support"
     - "Password Management Interface"
   stuck_tasks: []
