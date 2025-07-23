@@ -1,75 +1,174 @@
-from fastapi import FastAPI, APIRouter
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pymongo import MongoClient
+from datetime import datetime, timedelta
 import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List
 import uuid
-from datetime import datetime
+from typing import Optional
 
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
-# Create the main app without a prefix
 app = FastAPI()
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
-
-
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class StatusCheckCreate(BaseModel):
-    client_name: str
-
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
-async def root():
-    return {"message": "Hello World"}
-
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
-
-# Include the router in the main app
-app.include_router(api_router)
-
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# MongoDB connection
+MONGO_URL = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+DB_NAME = os.environ.get('DB_NAME', 'test_database')
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
+passwords_collection = db.passwords
+
+class PasswordCreate(BaseModel):
+    password: str
+    days: int
+    description: Optional[str] = ""
+
+class PasswordResponse(BaseModel):
+    id: str
+    description: str
+    created_at: datetime
+    expires_at: datetime
+    is_expired: bool
+    remaining_time: dict
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "developer": "Eng Youssef Elattar"}
+
+@app.post("/api/passwords", response_model=PasswordResponse)
+async def store_password(password_data: PasswordCreate):
+    """Store a password with time lock"""
+    if password_data.days < 1 or password_data.days > 100:
+        raise HTTPException(status_code=400, detail="Days must be between 1 and 100")
+    
+    created_at = datetime.utcnow()
+    expires_at = created_at + timedelta(days=password_data.days)
+    
+    password_doc = {
+        "id": str(uuid.uuid4()),
+        "password": password_data.password,
+        "description": password_data.description,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "is_active": True
+    }
+    
+    passwords_collection.insert_one(password_doc)
+    
+    # Calculate remaining time
+    remaining_delta = expires_at - datetime.utcnow()
+    remaining_time = {
+        "days": remaining_delta.days,
+        "hours": remaining_delta.seconds // 3600,
+        "minutes": (remaining_delta.seconds % 3600) // 60,
+        "total_seconds": int(remaining_delta.total_seconds())
+    }
+    
+    return PasswordResponse(
+        id=password_doc["id"],
+        description=password_doc["description"],
+        created_at=password_doc["created_at"],
+        expires_at=password_doc["expires_at"],
+        is_expired=False,
+        remaining_time=remaining_time
+    )
+
+@app.get("/api/passwords")
+async def get_active_passwords():
+    """Get all active password entries (without the actual passwords)"""
+    passwords = list(passwords_collection.find({"is_active": True}, {"password": 0}))
+    
+    result = []
+    for pwd in passwords:
+        remaining_delta = pwd["expires_at"] - datetime.utcnow()
+        is_expired = remaining_delta.total_seconds() <= 0
+        
+        if is_expired:
+            # Update the password as inactive if expired
+            passwords_collection.update_one(
+                {"id": pwd["id"]}, 
+                {"$set": {"is_active": False}}
+            )
+        
+        remaining_time = {
+            "days": max(0, remaining_delta.days),
+            "hours": max(0, remaining_delta.seconds // 3600),
+            "minutes": max(0, (remaining_delta.seconds % 3600) // 60),
+            "total_seconds": max(0, int(remaining_delta.total_seconds()))
+        }
+        
+        result.append({
+            "id": pwd["id"],
+            "description": pwd["description"],
+            "created_at": pwd["created_at"],
+            "expires_at": pwd["expires_at"],
+            "is_expired": is_expired,
+            "remaining_time": remaining_time
+        })
+    
+    return result
+
+@app.get("/api/passwords/{password_id}")
+async def get_password_details(password_id: str):
+    """Get password details including remaining time"""
+    password = passwords_collection.find_one({"id": password_id, "is_active": True})
+    
+    if not password:
+        raise HTTPException(status_code=404, detail="Password not found or expired")
+    
+    remaining_delta = password["expires_at"] - datetime.utcnow()
+    is_expired = remaining_delta.total_seconds() <= 0
+    
+    if is_expired:
+        # Update the password as inactive
+        passwords_collection.update_one(
+            {"id": password_id}, 
+            {"$set": {"is_active": False}}
+        )
+    
+    remaining_time = {
+        "days": max(0, remaining_delta.days),
+        "hours": max(0, remaining_delta.seconds // 3600),
+        "minutes": max(0, (remaining_delta.seconds % 3600) // 60),
+        "total_seconds": max(0, int(remaining_delta.total_seconds()))
+    }
+    
+    response = {
+        "id": password["id"],
+        "description": password["description"],
+        "created_at": password["created_at"],
+        "expires_at": password["expires_at"],
+        "is_expired": is_expired,
+        "remaining_time": remaining_time
+    }
+    
+    # Only include password if expired
+    if is_expired:
+        response["password"] = password["password"]
+    
+    return response
+
+@app.delete("/api/passwords/{password_id}")
+async def delete_password(password_id: str):
+    """Delete a password entry"""
+    result = passwords_collection.update_one(
+        {"id": password_id}, 
+        {"$set": {"is_active": False}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Password not found")
+    
+    return {"message": "Password deleted successfully"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
